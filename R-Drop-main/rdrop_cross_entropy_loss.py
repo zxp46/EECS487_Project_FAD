@@ -146,14 +146,35 @@ class RegLabelSmoothedCrossEntropyCriterion(FairseqCriterion):
          input(N, C) -> (N, 1)
         
         """
-        
+        import numpy as np
+        import json
+        idx2word = json.load("vocab.json")
+
+        assert(len(idx2word.keys())==lprobs.shape[1])
+
+        sampled_words=[]
+        for i in range(lprobs.shape[0]):
+            sampled_words.append(np.random.choice(idx2word.keys(),size=1,p=lprobs[i]))
+        generated_summary = " ".join(sampled_words)
+
         """
          TODO: ADD Roberta encoder
          input(target/sampled_lprobs, mask_pos)
          (N,1) -> (N + 1, 768)
          """
-         
+        from transformers import RobertaTokenizer, RobertaModel
+        roberta_tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+        roberta_model = RobertaModel.from_pretrained('roberta-base')
 
+        with torch.no_grad():
+            encoded_input = roberta_tokenizer(generated_summary, return_tensors='pt')
+            feature_vec = roberta_model(**encoded_input)
+        
+        # Alt:
+        # for param in roberta_tokenizer.parameters():
+        #     param.require_grad = False
+        # for param in roberta_model.parameters():
+        #     param.require_grad = False
 
         """
         out = out[1:]
