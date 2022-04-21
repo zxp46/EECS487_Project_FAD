@@ -31,8 +31,9 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
     from fairseq import meters
 
     # only one worker should attempt to create the required dir
-    if cfg.distributed_rank == 0:
-        os.makedirs(cfg.save_dir, exist_ok=True)
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    cfg.keep_best_checkpoints = 0
+
 
     prev_best = getattr(save_checkpoint, "best", val_loss)
     if val_loss is not None:
@@ -73,6 +74,7 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
         not hasattr(save_checkpoint, "best")
         or is_better(val_loss, save_checkpoint.best)
     )
+
     if val_loss is not None and cfg.keep_best_checkpoints > 0:
         checkpoint_conds[
             "checkpoint.best_{}_{:.2f}.pt".format(cfg.best_checkpoint_metric, val_loss)
@@ -221,9 +223,18 @@ def load_checkpoint(cfg: CheckpointConfig, trainer, **passthrough_args):
             epoch=1, load_dataset=True, **passthrough_args
         )
 
-    trainer.lr_step(epoch_itr.epoch)
+    """
+    # restore iterator from checkpoint
+    itr_state = extra_state["train_iterator"]
+    epoch_itr = trainer.get_train_iterator(
+        epoch=itr_state["epoch"], load_dataset=True, **passthrough_args
+    )
+    epoch_itr.load_state_dict(itr_state)
 
+    trainer.lr_step(epoch_itr.epoch)
+    """
     return extra_state, epoch_itr
+
 
 
 def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False):
@@ -397,6 +408,7 @@ def save_state(
     filename,
     cfg: FairseqConfig,
     model_state_dict,
+    disc_state_dict,
     criterion,
     optimizer,
     lr_scheduler,
@@ -415,6 +427,7 @@ def save_state(
         "cfg": cfg,
         "args": kwargs.get("args", None),
         "model": model_state_dict or {},
+        "discriminator": disc_state_dict or {},
         "optimizer_history": optim_history
         + [
             {

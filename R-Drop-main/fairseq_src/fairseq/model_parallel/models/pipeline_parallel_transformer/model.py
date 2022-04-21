@@ -312,7 +312,7 @@ class PipelineParallelTransformerModel(BaseFairseqModel):
         # In this case, the tuple has one element - the output tensor of logits
         logits = net_output if isinstance(net_output, torch.Tensor) else net_output[0]
         if log_probs:
-            return utils.log_softmax(logits, dim=-1, onnx_trace=False)
+            return utils.log_softmax(utils.softmax(logits, dim=-1, onnx_trace=False), dim=-1, onnx_trace=False)
         else:
             return utils.softmax(logits, dim=-1, onnx_trace=False)
 

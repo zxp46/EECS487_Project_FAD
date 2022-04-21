@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import Collection
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import List
 
@@ -63,7 +63,7 @@ class InverseSquareRootSchedule(FairseqLRScheduler):
         self.lr_step = (warmup_end_lr - cfg.warmup_init_lr) / cfg.warmup_updates
 
         # then, decay prop. to the inverse square root of the update number
-        self.decay_factor = warmup_end_lr * cfg.warmup_updates ** 0.5
+        self.decay_factor = warmup_end_lr * cfg.warmup_updates**0.5
 
         # initial learning rate
         self.lr = cfg.warmup_init_lr
@@ -80,6 +80,6 @@ class InverseSquareRootSchedule(FairseqLRScheduler):
         if num_updates < self.cfg.warmup_updates:
             self.lr = self.cfg.warmup_init_lr + num_updates * self.lr_step
         else:
-            self.lr = self.decay_factor * num_updates ** -0.5
+            self.lr = self.decay_factor * num_updates**-0.5
         self.optimizer.set_lr(self.lr)
         return self.lr

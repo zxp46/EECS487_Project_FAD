@@ -16,6 +16,7 @@ from itertools import chain
 from typing import Any, Dict, List
 
 import torch
+import torch.autograd as autograd
 from fairseq import checkpoint_utils, models, optim, utils
 from fairseq.dataclass.configs import FairseqConfig
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
@@ -24,9 +25,167 @@ from fairseq.file_io import PathManager
 from fairseq.logging import meters, metrics
 from fairseq.nan_detector import NanDetector
 from fairseq.optim import lr_scheduler
-
+from transformers import ElectraForPreTraining
+from fairseq.models import BaseFairseqModel
 
 logger = logging.getLogger(__name__)
+
+
+class CustomBARTModel(BaseFairseqModel):
+    def __init__(self, model, task):
+        super(CustomBARTModel, self).__init__()
+        self.bart = model
+        self.discriminator = ElectraForPreTraining.from_pretrained("electra-small-discriminator")
+        self.embed = torch.nn.Linear(768, 128)
+
+        self.s = torch.nn.Sigmoid()
+        self.disc_loss_fc = torch.nn.BCEWithLogitsLoss()
+        if hasattr(task, "target_dictionary"):
+            tgt_dict = task.target_dictionary
+            self.padding_idx = tgt_dict.pad() if tgt_dict is not None else -100
+
+    def label_smoothed_nll_loss(self, lprobs, target, epsilon, ignore_index=None, reduce=True):
+        if target.dim() == lprobs.dim() - 1:
+            target = target.unsqueeze(-1)
+        nll_loss = -lprobs.gather(dim=-1, index=target)
+        smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
+        if ignore_index is not None:
+            pad_mask = target.eq(ignore_index)
+            nll_loss.masked_fill_(pad_mask, 0.)
+            smooth_loss.masked_fill_(pad_mask, 0.)
+        else:
+            nll_loss = nll_loss.squeeze(-1)
+            smooth_loss = smooth_loss.squeeze(-1)
+        if reduce:
+            nll_loss = nll_loss.sum()
+            smooth_loss = smooth_loss.sum()
+        eps_i = epsilon / lprobs.size(-1)
+        loss = (1. - epsilon) * nll_loss + eps_i * smooth_loss
+        return loss, nll_loss
+
+    def compute_kl_loss(self, model, net_output, pad_mask=None, reduce=True):
+        net_prob = model.get_normalized_probs(net_output, log_probs=True)
+        net_prob_tec = model.get_normalized_probs(net_output, log_probs=False)
+
+        p, q, _, _ = torch.split(net_prob, net_prob.size(0) // 4, dim=0)
+        p_tec, q_tec, _, _ = torch.split(net_prob_tec, net_prob_tec.size(0) // 4, dim=0)
+
+        p_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none')
+        q_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none')
+
+        if pad_mask is not None:
+            p_loss.masked_fill_(pad_mask, 0.)
+            q_loss.masked_fill_(pad_mask, 0.)
+
+        if reduce:
+            p_loss = p_loss.sum()
+            q_loss = q_loss.sum()
+
+        loss = (p_loss + q_loss) / 2
+        return loss
+
+    def forward(self, sample, eps=1e-6, reduce=True):
+
+        sample_input = sample['net_input']
+        b_size, target_toks = sample['target'].shape
+        sample_toks = sample['net_input']['src_tokens'].shape[1]
+        target_length = sample['net_input']['src_lengths'].clone()
+        target_length[0] = target_toks
+        input_fake = sample['net_input']['src_tokens']
+        input_src = sample['target']
+        if sample_toks > target_toks:
+            input_length = sample['net_input']['src_tokens']
+            pad = torch.full((b_size, sample_toks - target_toks), self.padding_idx, device=sample["target"].device,
+                             dtype=sample["target"].dtype)
+            input_src = torch.cat([input_src, pad], dim=-1)
+
+        else:
+            input_length = target_length
+            pad = torch.full((b_size, target_toks - sample_toks), self.padding_idx, device=sample["target"].device,
+                             dtype=sample["target"].dtype)
+            input_fake = torch.cat([input_fake, pad], dim=-1)
+
+        sample_concat_input = {
+            'src_tokens': torch.cat([input_fake, input_fake.clone(), input_src, input_src.clone()], 0),
+            'src_lengths': torch.cat([input_length, input_length.clone(), input_length.clone(), input_length.clone()], 0),
+            'prev_output_tokens': torch.cat(
+                [sample_input['prev_output_tokens'], sample_input['prev_output_tokens'].clone(),
+                 sample_input['prev_output_tokens'].clone(), sample_input['prev_output_tokens'].clone()], 0),
+        }
+        target = sample['target']
+
+        net_output = self.bart(**sample_concat_input)
+
+        logits = net_output if isinstance(net_output, torch.Tensor) else net_output[0]
+        lprobs = utils.log_softmax(logits, dim=-1, onnx_trace=False)
+        lprobs, _ = torch.split(lprobs, b_size*2, dim=0)
+
+        lprobs = lprobs.view(-1, lprobs.size(-1))
+        pad_mask = target.unsqueeze(-1).eq(self.padding_idx)
+        target = torch.cat([target, target.clone()], dim=0)
+        loss, nll_loss = self.label_smoothed_nll_loss(
+            lprobs, target.view(-1, 1), eps, ignore_index=self.padding_idx, reduce=reduce,
+        )
+
+        kl_loss = self.compute_kl_loss(self.bart, net_output, pad_mask)
+        loss = loss + 0.6 * kl_loss
+
+        flag = False
+        disc_loss = None
+        if target_toks <= 512:
+            flag = True
+            pad_mask = 1 - pad_mask.long()
+            pad_mask = pad_mask.squeeze(-1)
+            mask_id = torch.cat([pad_mask, pad_mask.clone()], dim=0)
+
+            ratio = 0.7
+            replace_tokens = torch.randn((b_size*2, target_toks), device=sample["target"].device,
+                                         requires_grad=False) < ratio
+
+            #net_output_target = self.bart(**sample_target_input)
+            feats = net_output[1]['inner_states'][0]
+            feats = feats.permute(1, 0, 2)
+            _, feats_target = torch.split(feats, b_size*2, dim=0)
+            feats_target = feats_target.detach()
+
+            feats = net_output[1]['inner_states'][-1]
+            feats = feats.permute(1, 0, 2)
+            feats, _ = torch.split(feats, b_size*2, dim=0)
+
+            prob_fake = self.bart.get_normalized_probs(net_output, log_probs=False)
+            prob_fake, prob = torch.split(prob_fake, b_size*2, dim=0)
+            # prob = self.bart.get_normalized_probs(net_output_target, log_probs=True)
+            # prob = prob.view(-1, prob.size(-1))
+            # dist = torch.distributions.Categorical(prob.view(-1, prob.size(-1)))
+            # samples = dist.sample().view(b_size, -1)
+            # replace_tokens[samples != target] = True
+
+            # loss_target, nll_loss_target = self.label_smoothed_nll_loss(
+            #     prob, target.view(-1, 1), eps, ignore_index=self.padding_idx, reduce=reduce,
+            # )
+
+            disc_x = self.embed(feats_target)
+            disc_x_fake = self.embed(feats)
+
+            disc_x[replace_tokens == True, :] = disc_x_fake[replace_tokens == True, :]
+
+            fake_dist = torch.distributions.Categorical(prob_fake.view(-1, prob_fake.size(-1)))
+            samples = fake_dist.sample().view(b_size*2, -1)
+            replace_tokens[samples == target] = False
+
+            replace_tokens = replace_tokens.half()
+            out = self.discriminator(attention_mask=mask_id, inputs_embeds=disc_x)
+
+            pred = out.logits[mask_id > 0]
+
+            replace_tokens = 1 - replace_tokens
+
+            replace_tokens = replace_tokens[mask_id > 0]
+            disc_loss = self.disc_loss_fc(pred, replace_tokens)
+
+            loss = loss + 70 * disc_loss
+
+        return loss, nll_loss, disc_loss, flag
 
 
 class Trainer(object):
@@ -47,11 +206,12 @@ class Trainer(object):
             )
             cfg = convert_namespace_to_omegaconf(cfg)
 
+        model = CustomBARTModel(model, task)
         self.cfg = cfg
         self.task = task
 
         # catalog shared parameters
-        shared_params = _catalog_shared_params(model)
+        shared_params = _catalog_shared_params(model.bart)
         self.tpu = cfg.common.tpu
         self.cuda = torch.cuda.is_available() and not cfg.common.cpu and not self.tpu
         if self.cuda:
@@ -70,11 +230,13 @@ class Trainer(object):
         elif cfg.common.bf16:
             self._criterion = self._criterion.to(dtype=torch.bfloat16)
             self._model = self._model.to(dtype=torch.bfloat16)
+        elif cfg.common.amp:
+            self._amp_retries = 0
         if (
-            not cfg.distributed_training.pipeline_model_parallel
-            # the DistributedFairseqModel wrapper will handle moving to device,
-            # so only handle cases which don't use the wrapper
-            and not self.use_distributed_wrapper
+                not cfg.distributed_training.pipeline_model_parallel
+                # the DistributedFairseqModel wrapper will handle moving to device,
+                # so only handle cases which don't use the wrapper
+                and not self.use_distributed_wrapper
         ):
             self._criterion = self._criterion.to(device=self.device)
             self._model = self._model.to(device=self.device)
@@ -87,12 +249,12 @@ class Trainer(object):
 
         # check that shared parameters are preserved after device transfer
         for shared_param in shared_params:
-            ref = _get_module_by_path(self._model, shared_param[0])
+            ref = _get_module_by_path(self._model.bart, shared_param[0])
             for path in shared_param[1:]:
                 logger.info(
                     "detected shared parameter: {} <- {}".format(shared_param[0], path)
                 )
-                _set_module_by_path(self._model, path, ref)
+                _set_module_by_path(self._model.bart, path, ref)
 
         self._dummy_batch = None  # indicates we don't have a dummy batch at first
         self._lr_scheduler = None
@@ -167,16 +329,16 @@ class Trainer(object):
     @property
     def use_distributed_wrapper(self) -> bool:
         return (
-            self.data_parallel_world_size > 1
-            and not self.cfg.optimization.use_bmuf
+                self.data_parallel_world_size > 1
+                and not self.cfg.optimization.use_bmuf
         )
 
     @property
     def criterion(self):
         if self._wrapped_criterion is None:
             if (
-                utils.has_parameters(self._criterion)
-                and self.use_distributed_wrapper
+                    utils.has_parameters(self._criterion)
+                    and self.use_distributed_wrapper
             ):
                 self._wrapped_criterion = models.DistributedFairseqModel(
                     self.cfg.distributed_training,
@@ -222,25 +384,50 @@ class Trainer(object):
             )
         )
 
-        if self.cfg.common.fp16 or self.cfg.common.bf16:
+        if self.is_fsdp and self.cfg.common.fp16:
+            # FullyShardedDataParallel always uses MemoryEfficientFP16 wrapper,
+            # mostly for the grad scaling. But if we don't have the
+            # --memory-efficient-fp16 flag set, then we're effectively doing
+            # regular --fp16 and can allow the use of optimizers that would
+            # otherwise be unsupported by MemoryEfficientFP16Optimizer.
+            allow_unsupported = not self.cfg.common.memory_efficient_fp16
+            self._optimizer = optim.MemoryEfficientFP16Optimizer.build_optimizer(
+                self.cfg, params, allow_unsupported=allow_unsupported
+            )
+        elif self.cfg.common.fp16 or self.cfg.common.bf16 or self.cfg.common.amp:
             if self.cuda and torch.cuda.get_device_capability(0)[0] < 7:
                 logger.info(
-                    "NOTE: your device does NOT support faster training with --fp16, "
+                    "NOTE: your device does NOT support faster training with --fp16 or --amp, "
                     "please switch to FP32 which is likely to be faster"
                 )
             if (
-                self.cfg.common.memory_efficient_fp16
-                or self.cfg.common.memory_efficient_bf16
+                    self.cfg.common.memory_efficient_fp16
+                    or self.cfg.common.memory_efficient_bf16
             ):
                 self._optimizer = optim.MemoryEfficientFP16Optimizer.build_optimizer(
                     self.cfg, params
                 )
+            elif self.cfg.common.amp:
+                self._optimizer = optim.AMPOptimizer.build_optimizer(self.cfg, params)
             else:
                 self._optimizer = optim.FP16Optimizer.build_optimizer(self.cfg, params)
         else:
             if self.cuda and torch.cuda.get_device_capability(0)[0] >= 7:
-                logger.info("NOTE: your device may support faster training with --fp16")
+                logger.info(
+                    "NOTE: your device may support faster training with --fp16 or --amp"
+                )
             self._optimizer = optim.build_optimizer(self.cfg.optimizer, params)
+
+        if self.is_fsdp:
+            assert (
+                not self.cfg.optimization.use_bmuf
+            ), "--ddp-backend=fully_sharded is not compatible with BMUF"
+            assert self._optimizer.supports_flat_params, (
+                "--ddp-backend=fully_sharded is only compatible with pointwise "
+                "optimizers (e.g., Adam, AdamW, Adadelta, Adamax, SGD, etc.). "
+                "However, the sharding will result in slightly different results when "
+                "using non-pointwise optimizers (e.g., Adagrad, Adafactor, LAMB)"
+            )
 
         if self.cfg.optimization.use_bmuf:
             self._optimizer = optim.FairseqBMUF(
@@ -250,9 +437,9 @@ class Trainer(object):
 
         if self.cfg.distributed_training.zero_sharding == "os":
             if (
-                self.cfg.common.fp16
-                and not self.cfg.common.memory_efficient_fp16
-                and not self.cfg.common.memory_efficient_bf16
+                    self.cfg.common.fp16
+                    and not self.cfg.common.memory_efficient_fp16
+                    and not self.cfg.common.memory_efficient_bf16
             ) and not self.cfg.common.fp16_no_flatten_grads:
                 raise ValueError(
                     "ZeRO is incomptabile with fp16 and flattened grads. "
@@ -269,6 +456,10 @@ class Trainer(object):
         )
         self._lr_scheduler.step_update(0)
 
+    @property
+    def is_fsdp(self):
+        return self.cfg.distributed_training.ddp_backend == "fully_sharded"
+
     def consolidate_optimizer(self):
         """For OSS, we need to consolidate the state dict."""
         if hasattr(self.optimizer.optimizer, "consolidate_state_dict"):
@@ -282,7 +473,8 @@ class Trainer(object):
             checkpoint_utils.save_state(
                 filename,
                 self.cfg,
-                self.model.state_dict(),
+                self.model.bart.state_dict(),
+                self.model.discriminator.state_dict(),
                 self.criterion,
                 self.optimizer,
                 self.lr_scheduler,
@@ -293,12 +485,12 @@ class Trainer(object):
             logger.info(f"Finished saving checkpoint to {filename}")
 
     def load_checkpoint(
-        self,
-        filename,
-        reset_optimizer=False,
-        reset_lr_scheduler=False,
-        optimizer_overrides=None,
-        reset_meters=False,
+            self,
+            filename,
+            reset_optimizer=False,
+            reset_lr_scheduler=False,
+            optimizer_overrides=None,
+            reset_meters=False,
     ):
         """
         Load all training state from a checkpoint file.
@@ -312,10 +504,10 @@ class Trainer(object):
         bexists = PathManager.isfile(filename)
         if bexists:
             load_on_all_ranks = (
-                self.cfg.checkpoint.load_checkpoint_on_all_dp_ranks
-                # TPUs don't support broadcast yet, so load checkpoints
-                # on every worker for now
-                or self.tpu
+                    self.cfg.checkpoint.load_checkpoint_on_all_dp_ranks
+                    # TPUs don't support broadcast yet, so load checkpoints
+                    # on every worker for now
+                    or self.tpu
             )
 
             if load_on_all_ranks or self.data_parallel_rank == 0:
@@ -328,10 +520,10 @@ class Trainer(object):
                 # state. Later we will broadcast sharded states to each rank
                 # to avoid memory from exploding.
                 if (
-                    not load_on_all_ranks
-                    and self.cfg.distributed_training.zero_sharding == "os"
-                    and "last_optimizer_state" in state
-                    and is_distributed
+                        not load_on_all_ranks
+                        and self.cfg.distributed_training.zero_sharding == "os"
+                        and "last_optimizer_state" in state
+                        and is_distributed
                 ):
                     state["last_optimizer_state"] = "SHARDED"
             else:
@@ -350,9 +542,12 @@ class Trainer(object):
 
             # load model parameters
             try:
-                self.model.load_state_dict(
+                self.model.bart.load_state_dict(
                     state["model"], strict=True, model_cfg=self.cfg.model
                 )
+                # self.model.discriminator.load_state_dict(
+                #     state["discriminator"], strict=True
+                # )
                 if utils.has_parameters(self.get_criterion()):
                     self.get_criterion().load_state_dict(
                         state["criterion"], strict=True
@@ -372,10 +567,10 @@ class Trainer(object):
             # only reload optimizer and lr_scheduler if they match
             last_optim = self._optim_history[-1]
             assert (
-                last_optim["criterion_name"] == self.get_criterion().__class__.__name__
+                    last_optim["criterion_name"] == self.get_criterion().__class__.__name__
             ), "Criterion does not match; please reset the optimizer (--reset-optimizer)."
             assert (
-                last_optim["optimizer_name"] == self.optimizer.__class__.__name__
+                    last_optim["optimizer_name"] == self.optimizer.__class__.__name__
             ), "Optimizer does not match; please reset the optimizer (--reset-optimizer)."
 
             if not reset_lr_scheduler:
@@ -399,7 +594,7 @@ class Trainer(object):
 
             self.lr_step(epoch)
 
-            if itr_state["version"] >= 2 and itr_state["iterations_in_epoch"] == 0:
+            if itr_state["iterations_in_epoch"] == 0:
                 # reset meters at start of epoch
                 reset_meters = True
 
@@ -423,13 +618,13 @@ class Trainer(object):
         return extra_state
 
     def get_train_iterator(
-        self,
-        epoch,
-        combine=True,
-        load_dataset=True,
-        data_selector=None,
-        shard_batch_itr=True,
-        disable_iterator_cache=False,
+            self,
+            epoch,
+            combine=True,
+            load_dataset=True,
+            data_selector=None,
+            shard_batch_itr=True,
+            disable_iterator_cache=False,
     ):
         """Return an EpochBatchIterator over the training set for a given epoch."""
         if load_dataset:
@@ -446,7 +641,7 @@ class Trainer(object):
             max_sentences=self.cfg.dataset.batch_size,
             max_positions=utils.resolve_max_positions(
                 self.task.max_positions(),
-                self.model.max_positions(),
+                self.model.bart.max_positions(),
                 self.cfg.dataset.max_tokens,
             ),
             ignore_invalid_inputs=True,
@@ -463,9 +658,9 @@ class Trainer(object):
         return batch_iterator
 
     def get_valid_iterator(
-        self,
-        subset,
-        disable_iterator_cache=False,
+            self,
+            subset,
+            disable_iterator_cache=False,
     ):
         """Return an EpochBatchIterator over given validation subset for a given epoch."""
         batch_iterator = self.task.get_batch_iterator(
@@ -474,7 +669,7 @@ class Trainer(object):
             max_sentences=self.cfg.dataset.batch_size_valid,
             max_positions=utils.resolve_max_positions(
                 self.task.max_positions(),
-                self.model.max_positions(),
+                self.model.bart.max_positions(),
             ),
             ignore_invalid_inputs=self.cfg.dataset.skip_invalid_size_inputs_valid_test,
             required_batch_size_multiple=self.cfg.dataset.required_batch_size_multiple,
@@ -540,9 +735,9 @@ class Trainer(object):
                 all-reduce in the last backwards pass.
                 """
                 if (
-                    self.data_parallel_world_size > 1
-                    and hasattr(self.model, "no_sync")
-                    and i < len(samples) - 1
+                        self.data_parallel_world_size > 1
+                        and hasattr(self.model, "no_sync")
+                        and i < len(samples) - 1
                 ):
                     return self.model.no_sync()
                 else:
@@ -617,7 +812,7 @@ class Trainer(object):
                 logging_outputs, sample_size, ooms, train_time, ignore=is_dummy_batch
             )
             self._cumulative_training_time = (
-                total_train_time / self.data_parallel_world_size
+                    total_train_time / self.data_parallel_world_size
             )
 
         overflow = False
@@ -655,19 +850,33 @@ class Trainer(object):
             # on tpu check tensor is slow
             if not self.tpu:
                 if (
-                    not self.cfg.optimization.use_bmuf
-                    and self.cfg.distributed_training.ddp_backend != "slow_mo"
+                        not self.cfg.optimization.use_bmuf
+                        and self.cfg.distributed_training.ddp_backend != "slowmo"
                 ):
                     self._check_grad_norms(grad_norm)
                 if not torch.isfinite(grad_norm).all():
-                    # check local gradnorm single GPU case, trigger NanDetector
-                    raise FloatingPointError("gradients are Nan/Inf")
+                    # in case of AMP, if gradients are Nan/Inf then
+                    # optimizer step is still required
+                    if self.cfg.common.amp:
+                        overflow = True
+                    else:
+                        # check local gradnorm single GPU case, trigger NanDetector
+                        raise FloatingPointError("gradients are Nan/Inf")
 
             with torch.autograd.profiler.record_function("optimizer"):
                 # take an optimization step
                 self.task.optimizer_step(
                     self.optimizer, model=self.model, update_num=self.get_num_updates()
                 )
+                if self.cfg.common.amp and overflow:
+                    if self._amp_retries == self.cfg.common.amp_batch_retries:
+                        logger.info("AMP: skipping this batch.")
+                        self._amp_retries = 0
+                    else:
+                        self._amp_retries += 1
+                        return self.train_step(
+                            samples, raise_oom
+                        )  # recursion to feed in same batch
 
         except FloatingPointError:
             # re-run the forward and backward pass with hooks attached to print
@@ -758,13 +967,13 @@ class Trainer(object):
 
                 # clear CUDA cache to reduce memory fragmentation
                 if (
-                    self.cuda
-                    and self.cfg.common.empty_cache_freq > 0
-                    and (
+                        self.cuda
+                        and self.cfg.common.empty_cache_freq > 0
+                        and (
                         (self.get_num_updates() + self.cfg.common.empty_cache_freq - 1)
                         % self.cfg.common.empty_cache_freq
-                    )
-                    == 0
+                )
+                        == 0
                 ):
                     torch.cuda.empty_cache()
 
@@ -904,7 +1113,7 @@ class Trainer(object):
         elif name in {"valid_loss", "valid_nll_loss"}:
             # support for legacy train.py, which assumed these meters
             # are always initialized
-            k = name[len("valid_") :]
+            k = name[len("valid_"):]
             m = metrics.get_meter("valid", k)
             return m or meters.AverageMeter()
         elif name == "oom":
@@ -949,7 +1158,7 @@ class Trainer(object):
 
         if sample is None or len(sample) == 0:
             assert (
-                self._dummy_batch is not None and len(self._dummy_batch) > 0
+                    self._dummy_batch is not None and len(self._dummy_batch) > 0
             ), "Invalid dummy batch: {}".format(self._dummy_batch)
             sample, _ = self._prepare_sample(self._dummy_batch, is_dummy=True)
             return sample, True
@@ -1000,10 +1209,10 @@ class Trainer(object):
             return False
         elif self.cfg.optimization.use_bmuf:
             return (
-                self.get_num_updates() + 1
-            ) % self.cfg.bmuf.global_sync_iter == 0 and (
-                self.get_num_updates() + 1
-            ) > self.cfg.bmuf.warmup_iterations
+                           self.get_num_updates() + 1
+                   ) % self.cfg.bmuf.global_sync_iter == 0 and (
+                           self.get_num_updates() + 1
+                   ) > self.cfg.bmuf.warmup_iterations
         else:
             return True
 
@@ -1016,10 +1225,10 @@ class Trainer(object):
         sys.stderr.flush()
 
     def _aggregate_logging_outputs(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
         if self.task.__class__.logging_outputs_can_be_summed(self.get_criterion()):
             return self._fast_stat_sync_sum(
@@ -1031,10 +1240,10 @@ class Trainer(object):
             )
 
     def _all_gather_list_sync(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
         """
         Sync logging outputs across workers. all_gather_list_sync is
@@ -1059,10 +1268,10 @@ class Trainer(object):
         return logging_outputs, extra_stats_to_sum
 
     def _fast_stat_sync_sum(
-        self,
-        logging_outputs: List[Dict[str, Any]],
-        *extra_stats_to_sum,
-        ignore=False,
+            self,
+            logging_outputs: List[Dict[str, Any]],
+            *extra_stats_to_sum,
+            ignore=False,
     ):
         """
         Sync logging outputs across workers. fast_stat_sync_sum is
@@ -1110,8 +1319,8 @@ class Trainer(object):
             def is_consistent(tensor):
                 max_abs_diff = torch.max(torch.abs(tensor - tensor[0]))
                 return (
-                    torch.isfinite(tensor).all()
-                    or (max_abs_diff / (tensor[0] + 1e-6) < 1e-6).all()
+                        torch.isfinite(tensor).all()
+                        or (max_abs_diff / (tensor[0] + 1e-6) < 1e-6).all()
                 )
 
             if not is_consistent(self._grad_norm_buf):
@@ -1135,7 +1344,7 @@ class Trainer(object):
 
     def _reduce_and_log_stats(self, logging_outputs, sample_size, grad_norm=None):
         if grad_norm is not None and (
-            not torch.is_tensor(grad_norm) or torch.isfinite(grad_norm)
+                not torch.is_tensor(grad_norm) or torch.isfinite(grad_norm)
         ):
             metrics.log_speed("ups", 1.0, priority=100, round=2)
             metrics.log_scalar("gnorm", grad_norm, priority=400, round=3)
@@ -1172,6 +1381,7 @@ class Trainer(object):
             else:
                 logging_output = agg.get_smoothed_values()
                 logging_output["sample_size"] = sample_size
+
                 for key_to_delete in ["ppl", "wps", "wpb", "bsz"]:
                     if key_to_delete in logging_output:
                         del logging_output[key_to_delete]

@@ -23,10 +23,10 @@ class RDropTranslationTask(TranslationTask):
         self.criterion_reg_alpha = getattr(args, 'reg_alpha', 0)
 
     def train_step(
-        self, sample, model, criterion, optimizer, update_num, ignore_grad=False
+        self, sample, model, criterion, optimizer, update_num, ignore_grad=False, itr=0
     ):  
         model.train()
         model.set_num_updates(update_num)
         with torch.autograd.profiler.record_function("forward"):
-            loss, sample_size, logging_output = criterion.forward_reg(model, sample, optimizer, self.criterion_reg_alpha, ignore_grad)
+            loss, sample_size, logging_output = criterion.forward(model, sample, optimizer, self.criterion_reg_alpha, ignore_grad, itr)
         return loss, sample_size, logging_output

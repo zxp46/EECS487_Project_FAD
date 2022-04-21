@@ -381,6 +381,7 @@ class SequenceGenerator(nn.Module):
                 )
 
             # Shape: (batch, cand_size)
+            # modified
             cand_scores, cand_indices, cand_beams = self.search.step(
                 step,
                 lprobs.view(bsz, -1, self.vocab_size),

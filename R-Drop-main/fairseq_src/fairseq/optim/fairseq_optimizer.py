@@ -6,16 +6,12 @@
 import torch
 from fairseq import utils
 from fairseq.dataclass.utils import gen_parser_from_dataclass
-import numpy as np
 
 
 class FairseqOptimizer(object):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-
-        self.surgery_grad_cache = {}
-        self.surgery_shape_cache = {}
 
     @classmethod
     def add_args(cls, parser):
@@ -176,62 +172,6 @@ class FairseqOptimizer(object):
             return self.optimizer.broadcast_global_state_dict(state_dict)
         else:
             return state_dict
-
-    def zero_surgery_cache(self):
-        self.surgery_grad_cache = {}
-        self.surgery_encoder_grad_cache = {}
-        self.surgery_shape_cache = {}
-
-    def save_surgery_grad(self, surgery_key):
-        """ must run after loss backward """
-        if surgery_key not in self.surgery_grad_cache:
-            self.surgery_grad_cache[surgery_key] = []
-            self.surgery_shape_cache[surgery_key] = []
-
-        grad_tmp = []
-        if getattr(self, "fp32_optimizer", None) is not None:
-            for p in self.fp16_params:
-                if p.grad is None: continue
-                grad_tmp.append(p.grad.clone())
-                self.surgery_shape_cache[surgery_key].append(p.grad.shape)
-            self.surgery_grad_cache[surgery_key] = torch.cat([g.flatten() for g in grad_tmp]).double()
-            self.surgery_encoder_grad_cache[surgery_key] = torch.cat([g.flatten() for g in grad_tmp[len(grad_tmp)//2:]]).double()
-        else:
-            for group in self.optimizer.param_groups:
-                for p in group["params"]:
-                    if p.grad is None: continue
-                    grad_tmp.append(p.grad.clone())
-                    self.surgery_shape_cache[surgery_key].append(p.grad.shape)
-            self.surgery_grad_cache[surgery_key] = torch.cat([g.flatten() for g in grad_tmp])
-            self.surgery_encoder_grad_cache[surgery_key] = torch.cat([g.flatten() for g in grad_tmp[len(grad_tmp)//2:]])
-    
-    def set_surgery_grad(self, surgery_all_key):
-        for surgery_key in surgery_all_key:
-            unflatten_grad, idx = [], 0
-            for shape in self.surgery_shape_cache[surgery_key]:
-                length = np.prod(shape)
-                unflatten_grad.append(self.surgery_grad_cache[surgery_key][idx:idx + length].view(shape))
-                idx += length
-            p_idx = 0
-            for group in self.optimizer.param_groups:
-                if getattr(self, "fp32_optimizer", None) is not None:
-                    for p in self.fp16_params:
-                        if p.grad is None: continue
-                        p.grad += unflatten_grad[p_idx]
-                        p_idx += 1
-                else:
-                    for p in group['params']:
-                        if p.grad is None: continue
-                        p.grad += unflatten_grad[p_idx]
-                        p_idx += 1
-
-    def gradient_sim(self, master_key, comp_key):
-        g_i = self.surgery_grad_cache[master_key]
-        g_j = self.surgery_grad_cache[comp_key]
-        # g_i = self.surgery_encoder_grad_cache[master_key]
-        # g_j = self.surgery_encoder_grad_cache[comp_key]
-        cosine = torch.cosine_similarity(g_i, g_j, dim=0)
-        return cosine
 
 
 class LegacyFairseqOptimizer(FairseqOptimizer):
