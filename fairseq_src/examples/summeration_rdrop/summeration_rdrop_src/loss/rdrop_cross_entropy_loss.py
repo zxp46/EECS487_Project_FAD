@@ -47,6 +47,8 @@ class RegLabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.eps = label_smoothing
+        self.disc_loss_fc = torch.nn.BCEWithLogitsLoss()
+
 
     @staticmethod
     def add_args(parser):
@@ -94,13 +96,18 @@ class RegLabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         1) the loss
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
+        print("input")
+        for key in sample['net_input'].keys():
+            print(key, sample['net_input'][key].shape)
         """
-        net_output = model(**sample['net_input'])
-        loss, nll_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
+
+        net_output = model.bart(**sample['net_input'])
+        loss, nll_loss = self.compute_loss(model.bart, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0) if self.sentence_avg else sample['ntokens']
         logging_output = {
             'loss': loss.data,
             'nll_loss': nll_loss.data,
+            'disc_loss': 0,
             'ntokens': sample['ntokens'],
             'nsentences': sample['target'].size(0),
             'sample_size': sample_size,
@@ -130,39 +137,74 @@ class RegLabelSmoothedCrossEntropyCriterion(FairseqCriterion):
     
     def forward_reg(self, model, sample, optimizer, reg_alpha, ignore_grad, reduce=True):
         
-        sample_input = sample['net_input']
-        sample_concat_input = {
-            'src_tokens': torch.cat([sample_input['src_tokens'], sample_input['src_tokens'].clone()], 0),
-            'src_lengths': torch.cat([sample_input['src_lengths'], sample_input['src_lengths'].clone()], 0),
-            'prev_output_tokens': torch.cat([sample_input['prev_output_tokens'], sample_input['prev_output_tokens'].clone()], 0),
-        }
+        # print(sample.keys())
+        loss, nll_loss, disc_loss, flag = model(sample, self.eps, reduce)
         
-        net_output = model(**sample_concat_input)
-        lprobs = model.get_normalized_probs(net_output, log_probs=True)
-        lprobs = lprobs.view(-1, lprobs.size(-1))
+        
+        """
+        if out != None:
+            pred = out.logits*mask_id
 
-        target = model.get_targets(sample, net_output)
+            replace_tokens = replace_tokens * mask_id
+            loss_disc = self.disc_loss_fc(pred, replace_tokens)
+        
+        lprobs = model.bart.get_normalized_probs(net_output, log_probs=True)
+        lprobs = lprobs.view(-1, lprobs.size(-1))
+        """
+        
+        """
+         TODO: sample from lprobs
+         input(N, C) -> (N, 1)
+        
+        """
+        
+        """
+         TODO: ADD Roberta encoder
+         input(target/sampled_lprobs, mask_pos)
+         (N,1) -> (N + 1, 768)
+         """
+         
+
+
+        """
+        out = out[1:]
+        out_gen
+        rate = 0.4
+        out[random_place,:] = out_gen[random_place,:]
+        torch.argmax(lprobs, dim=1)
+        """
+        
+        """
+         TODO: Replace words and send into Electra
+         input(Robert_out, mask_ids, replace_ids)
+         (N, 768) -> Loss(1)
+        """
+        
+        """
+        target = sample['target']
         pad_mask = target.unsqueeze(-1).eq(self.padding_idx)
-        target = torch.cat([target, target.clone()], dim=0)
         loss, nll_loss = label_smoothed_nll_loss(
             lprobs, target.view(-1, 1), self.eps, ignore_index=self.padding_idx, reduce=reduce,
         )
-        
-        kl_loss = self.compute_kl_loss(model, net_output, pad_mask)
-        loss += reg_alpha * kl_loss
+        """
+        """
+        if out != None:
+            loss = loss + 5*loss_disc
+        """
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
             optimizer.backward(loss)
-
+        
         ntokens = sample['ntokens']
         nsentences = sample['target'].size(0)
         sample_size = sample['ntokens']
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,
+            'disc_loss': utils.item(disc_loss.data) if disc_loss else 0,
             'nll_loss': utils.item(nll_loss.data) if reduce else nll_loss.data,
             'ntokens': ntokens,
             'nsentences': nsentences,
             'sample_size': sample_size,
-        }
+        }            
         return loss, sample_size, logging_output
