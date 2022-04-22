@@ -5,6 +5,8 @@ major modified files: **fairseq\_src/fairseq/trainer.py fairseq\_src/fairseq/che
 
 Our model is specified in **fairseq_src/fairseq/trainer.py**
 
+Finetuned model for R-drop + FAD can be found [here](https://drive.google.com/drive/folders/1-lu4UAb3G5qVaDgmfz7ZB_jZPnqpnJyD)
+
 For usage, follow the instructions in Abstractive Summarization Task.
 
 
