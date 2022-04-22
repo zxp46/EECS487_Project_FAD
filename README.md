@@ -5,9 +5,9 @@ major modified files:
 
 **fairseq\_src/fairseq/trainer.py**
 
-**fairseq\_src/fairseq/check\_utils.py **
+**fairseq\_src/fairseq/check\_utils.py**
 
-**fairseq\_src/fairseq_cli/train.py **
+**fairseq\_src/fairseq_cli/train.py**
 
 **fairseq_src/examples/summeration_rdrop/summeration_rdrop_src/loss/rdrop_cross_entropy_loss.py**
 
