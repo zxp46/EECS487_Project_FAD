@@ -17,23 +17,5 @@ Finetuned model for R-drop + FAD can be found [here](https://drive.google.com/dr
 
 For usage, follow the instructions in Abstractive Summarization Task.
 
+Follow the link to train abstractive summarization task. [Abstractive Summarization Task](fairseq_src/README.md)
 
-```
-
-## Quick Links:
-R-Drop is capable to handle many tasks for both NLP and CV:
-
-1. [Neural Machine Translation Task](fairseq_src/README.md)
-
-2. [Abstractive Summarization Task](fairseq_src/README.md)
-
-3. [Language Modeling Task](fairseq_src/README.md)
-
-4. [Language Understanding Task](huggingface_transformer_src/README.md)
-
-5. [Image Classification Task](vit_src/README.md)
-
-
-
-
-```
